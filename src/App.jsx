@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect } from 'react';
 import { processImageToBeadGrid } from './utils/imageProcessor';
+import { cartoonizeImageWithAI } from './utils/aiClient';
 
 /** 计算 RGB 相对亮度（用于选择文字颜色） */
 function getLuminance(r, g, b) {
@@ -73,10 +74,16 @@ function BeadGridPreview({ grid, zoom = 1 }) {
 }
 
 function App() {
+  const [uploadedFile, setUploadedFile] = useState(null);
   const [imageUrl, setImageUrl] = useState(null);
+  const [cartoonImageUrl, setCartoonImageUrl] = useState(null);
+  const [useAICartoon, setUseAICartoon] = useState(false);
+  const [apiKey, setApiKey] = useState('');
+  const [cartoonPrompt, setCartoonPrompt] = useState('');
   const [gridSize, setGridSize] = useState(32);
   const [previewZoom, setPreviewZoom] = useState(1);
   const [beadData, setBeadData] = useState(null);
+  const [aiLoading, setAiLoading] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
@@ -90,6 +97,8 @@ function App() {
     }
 
     setError(null);
+    setUploadedFile(file);
+    setCartoonImageUrl(null);
     const reader = new FileReader();
     reader.onload = (event) => {
       setImageUrl(event.target.result);
@@ -98,12 +107,13 @@ function App() {
   }, []);
 
   const processImage = useCallback(async () => {
-    if (!imageUrl) return;
+    const sourceUrl = useAICartoon ? cartoonImageUrl : imageUrl;
+    if (!sourceUrl) return;
 
     setLoading(true);
     setError(null);
     try {
-      const result = await processImageToBeadGrid(imageUrl, gridSize);
+      const result = await processImageToBeadGrid(sourceUrl, gridSize);
       setBeadData(result);
     } catch (err) {
       setError(err.message || '图片处理失败');
@@ -111,15 +121,39 @@ function App() {
     } finally {
       setLoading(false);
     }
-  }, [imageUrl, gridSize]);
+  }, [imageUrl, cartoonImageUrl, useAICartoon, gridSize]);
+
+  const handleAICartoonize = useCallback(async () => {
+    if (!uploadedFile) {
+      setError('请先上传照片');
+      return;
+    }
+
+    setAiLoading(true);
+    setError(null);
+    try {
+      const { imageUrl: generatedUrl } = await cartoonizeImageWithAI({
+        file: uploadedFile,
+        apiKey,
+        prompt: cartoonPrompt,
+      });
+      setCartoonImageUrl(generatedUrl);
+    } catch (err) {
+      setCartoonImageUrl(null);
+      setError(err.message || 'AI 卡通化失败');
+    } finally {
+      setAiLoading(false);
+    }
+  }, [uploadedFile, apiKey, cartoonPrompt]);
 
   useEffect(() => {
-    if (imageUrl) {
+    const sourceUrl = useAICartoon ? cartoonImageUrl : imageUrl;
+    if (sourceUrl) {
       processImage();
     } else {
       setBeadData(null);
     }
-  }, [imageUrl, gridSize, processImage]);
+  }, [imageUrl, cartoonImageUrl, useAICartoon, gridSize, processImage]);
 
   const colorList = beadData?.colorCounts ?? [];
   const totalBeads = colorList.reduce((sum, c) => sum + c.count, 0);
@@ -151,6 +185,45 @@ function App() {
             </label>
 
             <div className="mt-4">
+              <div className="mb-4 rounded-lg border border-stone-200 bg-stone-50 p-3">
+                <label className="flex items-center gap-2 text-sm font-medium text-stone-700">
+                  <input
+                    type="checkbox"
+                    checked={useAICartoon}
+                    onChange={(e) => setUseAICartoon(e.target.checked)}
+                    className="h-4 w-4 accent-amber-500"
+                  />
+                  先用 AI 转卡通再生成拼豆图纸
+                </label>
+
+                {useAICartoon && (
+                  <div className="mt-3 space-y-2">
+                    <input
+                      type="password"
+                      value={apiKey}
+                      onChange={(e) => setApiKey(e.target.value)}
+                      placeholder="输入 OpenAI API Key（仅保存在本页内存）"
+                      className="w-full rounded border border-stone-300 px-2 py-1 text-sm"
+                    />
+                    <textarea
+                      value={cartoonPrompt}
+                      onChange={(e) => setCartoonPrompt(e.target.value)}
+                      placeholder="可选：自定义卡通风格提示词"
+                      rows={3}
+                      className="w-full rounded border border-stone-300 px-2 py-1 text-sm"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleAICartoonize}
+                      disabled={!uploadedFile || aiLoading}
+                      className="w-full rounded bg-amber-500 px-3 py-2 text-sm font-medium text-white transition hover:bg-amber-600 disabled:cursor-not-allowed disabled:bg-stone-300"
+                    >
+                      {aiLoading ? 'AI 正在卡通化…' : '生成 AI 卡通图'}
+                    </button>
+                  </div>
+                )}
+              </div>
+
               <label className="mb-2 block text-sm font-medium text-stone-700">
                 网格尺寸（珠子数量）
               </label>
@@ -188,6 +261,16 @@ function App() {
             )}
             {!loading && beadData && (
               <>
+                {useAICartoon && cartoonImageUrl && (
+                  <div className="mb-4">
+                    <p className="mb-2 text-sm text-stone-600">AI 卡通化结果</p>
+                    <img
+                      src={cartoonImageUrl}
+                      alt="AI卡通图"
+                      className="max-h-64 rounded-lg border border-stone-200"
+                    />
+                  </div>
+                )}
                 <div className="mb-3 flex items-center gap-4">
                   <label className="flex items-center gap-2 text-sm text-stone-600">
                     <span>预览缩放：</span>
@@ -210,6 +293,11 @@ function App() {
             {!imageUrl && !loading && (
               <div className="flex min-h-[320px] items-center justify-center rounded-lg border-2 border-dashed border-stone-200 text-stone-400">
                 请先上传一张图片
+              </div>
+            )}
+            {imageUrl && useAICartoon && !cartoonImageUrl && !loading && !aiLoading && (
+              <div className="flex min-h-[320px] items-center justify-center rounded-lg border border-amber-200 bg-amber-50 px-6 text-center text-amber-700">
+                已上传原图，请先点击“生成 AI 卡通图”，再自动生成拼豆图纸
               </div>
             )}
           </div>
