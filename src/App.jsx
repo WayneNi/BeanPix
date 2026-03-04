@@ -1,257 +1,405 @@
-import { useState, useCallback, useEffect } from 'react';
-import { processImageToBeadGrid } from './utils/imageProcessor';
-
-/** 计算 RGB 相对亮度（用于选择文字颜色） */
-function getLuminance(r, g, b) {
-  return (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-}
-
-/** 拼豆网格预览（带色号显示） */
-function BeadGridPreview({ grid, zoom = 1 }) {
-  const cols = grid[0]?.length ?? 0;
-  const rows = grid.length;
-  const maxPreview = 700;
-  const baseCellSize = Math.max(3, Math.min(24, Math.floor(maxPreview / Math.max(cols, rows))));
-  const cellSize = Math.round(baseCellSize * zoom);
-  const showCode = cellSize >= 10;
-  const fontSize = Math.max(5, Math.min(cellSize - 2, 11));
-  const fontWeight = cellSize >= 14 ? 'bold' : 'normal';
-
-  return (
-    <div
-      className="overflow-auto rounded-lg border border-stone-200 bg-stone-50 p-4"
-      style={{ maxHeight: '70vh' }}
-    >
-      <div
-        className="inline-grid gap-px"
-        style={{
-          gridTemplateColumns: `repeat(${cols}, ${cellSize}px)`,
-          gridTemplateRows: `repeat(${rows}, ${cellSize}px)`,
-        }}
-      >
-        {grid.map((row, y) =>
-          row.map((color, x) => {
-            const code = color.code ?? '?';
-            const luminance = getLuminance(color.r ?? 128, color.g ?? 128, color.b ?? 128);
-            const textColor = luminance > 0.5 ? '#1a1a1a' : '#ffffff';
-            const textShadow = luminance > 0.5
-              ? '0 0 1px #fff, 0 1px 1px #fff'
-              : '0 0 1px #000, 0 1px 1px #000';
-
-            return (
-              <div
-                key={`${y}-${x}`}
-                className="flex items-center justify-center overflow-hidden rounded-sm select-none"
-                style={{
-                  backgroundColor: color.hex,
-                  minWidth: cellSize,
-                  minHeight: cellSize,
-                }}
-                title={`${code} ${color.name} - (${x}, ${y})`}
-              >
-                {showCode && (
-                  <span
-                    className="leading-none"
-                    style={{
-                      color: textColor,
-                      fontSize: `${fontSize}px`,
-                      fontWeight,
-                      textShadow,
-                      lineHeight: 1,
-                    }}
-                  >
-                    {code}
-                  </span>
-                )}
-              </div>
-            );
-          })
-        )}
-      </div>
-    </div>
-  );
-}
+import { useState, useCallback, useMemo, useRef } from 'react';
+import { getPalette } from './config/colorPalette';
+import {
+  calculatePixelGrid,
+  mergeSimilarColors,
+  autoRemoveBackground,
+  recalculateColorStats,
+  PixelationMode,
+} from './utils/pixelation';
+import { paintSinglePixel, floodFillErase, replaceColor } from './utils/pixelEditingUtils';
+import { importCsvData } from './utils/imageDownloader';
+import { SettingsPanel } from './components/SettingsPanel';
+import { PixelatedPreviewCanvas } from './components/PixelatedPreviewCanvas';
+import { ColorPanel } from './components/ColorPanel';
+import { GridTooltip } from './components/GridTooltip';
+import { FloatingToolbar } from './components/FloatingToolbar';
+import { FloatingColorPalette } from './components/FloatingColorPalette';
+import { AIOptimizeModal } from './components/AIOptimizeModal';
+import { ImageCropperModal } from './components/ImageCropperModal';
+import { DownloadSettingsModal } from './components/DownloadSettingsModal';
+import { MagnifierTool } from './components/MagnifierTool';
+import { CustomPaletteEditor } from './components/CustomPaletteEditor';
+import { FocusMode } from './components/FocusMode';
 
 function App() {
-  const [imageUrl, setImageUrl] = useState(null);
-  const [gridSize, setGridSize] = useState(32);
-  const [previewZoom, setPreviewZoom] = useState(1);
-  const [beadData, setBeadData] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
+  const [originalImageUrl, setOriginalImageUrl] = useState(null);
+  const [granularity, setGranularity] = useState(32);
+  const [pixelationMode, setPixelationMode] = useState(PixelationMode.Dominant);
+  const [paletteId, setPaletteId] = useState('full');
+  const [colorSystem, setColorSystem] = useState('MARD');
+  const [similarityThreshold, setSimilarityThreshold] = useState(15);
+  const [mappedPixelData, setMappedPixelData] = useState(null);
+  const [gridDimensions, setGridDimensions] = useState(null);
+  const [colorCounts, setColorCounts] = useState(null);
+  const [totalCount, setTotalCount] = useState(0);
+  const [excludedKeys, setExcludedKeys] = useState(new Set());
+  const [processing, setProcessing] = useState(false);
+  const [tooltipData, setTooltipData] = useState(null);
+  const [showGridLines, setShowGridLines] = useState(true);
+  const [showColorKeys, setShowColorKeys] = useState(false);
+
+  const [isEditMode, setIsEditMode] = useState(false);
+  const [isEraseMode, setIsEraseMode] = useState(false);
+  const [selectedEditColor, setSelectedEditColor] = useState(null);
+  const [undoStack, setUndoStack] = useState([]);
+  const [showAiModal, setShowAiModal] = useState(false);
+  const [showCropModal, setShowCropModal] = useState(false);
+  const [showDownloadModal, setShowDownloadModal] = useState(false);
+  const [showMagnifier, setShowMagnifier] = useState(false);
+  const [showCustomPalette, setShowCustomPalette] = useState(false);
+  const [showFocusMode, setShowFocusMode] = useState(false);
+  const [customPalette, setCustomPalette] = useState(null);
+
+  const imgRef = useRef(null);
+
+  const activePalette = useMemo(() => {
+    if (customPalette && paletteId === 'custom') return customPalette;
+    return getPalette(paletteId, colorSystem);
+  }, [paletteId, colorSystem, customPalette]);
+
+  const updateGridAndStats = useCallback((newGrid) => {
+    setMappedPixelData(newGrid);
+    const stats = recalculateColorStats(newGrid);
+    setColorCounts(stats.colorCounts);
+    setTotalCount(stats.totalCount);
+  }, []);
+
+  const pushUndo = useCallback((grid) => {
+    setUndoStack((prev) => [...prev.slice(-20), grid]);
+  }, []);
+
+  const handleUndo = useCallback(() => {
+    setUndoStack((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      updateGridAndStats(last);
+      return prev.slice(0, -1);
+    });
+  }, [updateGridAndStats]);
 
   const handleFileUpload = useCallback((e) => {
     const file = e.target.files?.[0];
     if (!file) return;
-
-    if (!file.type.startsWith('image/')) {
-      setError('请上传图片文件（支持 JPG、PNG、GIF 等格式）');
+    if (file.name.endsWith('.csv')) {
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        try {
+          const { grid, dimensions } = importCsvData(ev.target.result);
+          setMappedPixelData(grid);
+          setGridDimensions(dimensions);
+          const stats = recalculateColorStats(grid);
+          setColorCounts(stats.colorCounts);
+          setTotalCount(stats.totalCount);
+          setUndoStack([]);
+        } catch (err) {
+          alert(`CSV 导入失败: ${err.message}`);
+        }
+      };
+      reader.readAsText(file);
       return;
     }
-
-    setError(null);
+    if (!file.type.startsWith('image/')) return;
     const reader = new FileReader();
-    reader.onload = (event) => {
-      setImageUrl(event.target.result);
+    reader.onload = (ev) => {
+      setOriginalImageUrl(ev.target.result);
+      setMappedPixelData(null);
+      setGridDimensions(null);
+      setColorCounts(null);
+      setUndoStack([]);
+      setIsEditMode(false);
     };
     reader.readAsDataURL(file);
   }, []);
 
-  const processImage = useCallback(async () => {
-    if (!imageUrl) return;
+  const handleAiApply = useCallback((dataUrl) => {
+    setOriginalImageUrl(dataUrl);
+    setShowAiModal(false);
+    setMappedPixelData(null);
+  }, []);
 
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await processImageToBeadGrid(imageUrl, gridSize);
-      setBeadData(result);
-    } catch (err) {
-      setError(err.message || '图片处理失败');
-      setBeadData(null);
-    } finally {
-      setLoading(false);
-    }
-  }, [imageUrl, gridSize]);
+  const handleCropApply = useCallback((dataUrl) => {
+    setOriginalImageUrl(dataUrl);
+    setShowCropModal(false);
+    setMappedPixelData(null);
+  }, []);
 
-  useEffect(() => {
-    if (imageUrl) {
-      processImage();
-    } else {
-      setBeadData(null);
-    }
-  }, [imageUrl, gridSize, processImage]);
+  const handleCustomPaletteApply = useCallback((palette) => {
+    setCustomPalette(palette);
+    setPaletteId('custom');
+    setShowCustomPalette(false);
+  }, []);
 
-  const colorList = beadData?.colorCounts ?? [];
-  const totalBeads = colorList.reduce((sum, c) => sum + c.count, 0);
+  const processImage = useCallback(
+    (imgSrc) => {
+      const src = imgSrc || originalImageUrl;
+      if (!src) return;
+      setProcessing(true);
+
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        imgRef.current = img;
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+
+        const N = granularity;
+        const M = Math.max(1, Math.round((img.height / img.width) * N));
+
+        let filteredPalette = activePalette;
+        if (excludedKeys.size > 0) {
+          filteredPalette = activePalette.filter((c) => !excludedKeys.has(c.key));
+        }
+        if (filteredPalette.length === 0) filteredPalette = activePalette;
+
+        let grid = calculatePixelGrid(ctx, img.width, img.height, N, M, filteredPalette, pixelationMode);
+        grid = mergeSimilarColors(grid, filteredPalette, similarityThreshold);
+
+        setMappedPixelData(grid);
+        setGridDimensions({ N, M });
+        const stats = recalculateColorStats(grid);
+        setColorCounts(stats.colorCounts);
+        setTotalCount(stats.totalCount);
+        setUndoStack([]);
+        setProcessing(false);
+      };
+      img.onerror = () => setProcessing(false);
+      img.src = src;
+    },
+    [originalImageUrl, granularity, pixelationMode, activePalette, similarityThreshold, excludedKeys]
+  );
+
+  const handleAutoRemoveBg = useCallback(() => {
+    if (!mappedPixelData) return;
+    pushUndo(mappedPixelData);
+    updateGridAndStats(autoRemoveBackground(mappedPixelData));
+  }, [mappedPixelData, pushUndo, updateGridAndStats]);
+
+  const handleToggleExclude = useCallback((key) => {
+    setExcludedKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  const handleCellClick = useCallback(
+    (data) => {
+      if (!isEditMode || !mappedPixelData || !gridDimensions || !data) return;
+      pushUndo(mappedPixelData);
+
+      if (isEraseMode) {
+        const cell = data.cell;
+        if (cell && !cell.isExternal) {
+          const newGrid = floodFillErase(mappedPixelData, gridDimensions, data.j, data.i, cell.key);
+          updateGridAndStats(newGrid);
+        }
+      } else if (selectedEditColor) {
+        const { newPixelData, hasChange } = paintSinglePixel(
+          mappedPixelData, data.j, data.i,
+          { key: selectedEditColor.key, color: selectedEditColor.hex, isExternal: false }
+        );
+        if (hasChange) updateGridAndStats(newPixelData);
+      }
+    },
+    [isEditMode, isEraseMode, selectedEditColor, mappedPixelData, gridDimensions, pushUndo, updateGridAndStats]
+  );
+
+  const handleColorReplace = useCallback(() => {
+    if (!mappedPixelData || !gridDimensions) return;
+    const srcHex = prompt('请输入要替换的颜色HEX值（如 #FF0000）:');
+    const tgtHex = prompt('请输入目标颜色HEX值:');
+    if (!srcHex || !tgtHex) return;
+
+    const srcPc = activePalette.find((p) => p.hex.toUpperCase() === srcHex.toUpperCase());
+    const tgtPc = activePalette.find((p) => p.hex.toUpperCase() === tgtHex.toUpperCase());
+    if (!srcPc || !tgtPc) { alert('未在当前色板中找到该颜色'); return; }
+
+    pushUndo(mappedPixelData);
+    const { newPixelData, replaceCount } = replaceColor(
+      mappedPixelData, gridDimensions,
+      { key: srcPc.key, color: srcPc.hex },
+      { key: tgtPc.key, color: tgtPc.hex }
+    );
+    updateGridAndStats(newPixelData);
+    alert(`已替换 ${replaceCount} 个像素`);
+  }, [mappedPixelData, gridDimensions, activePalette, pushUndo, updateGridAndStats]);
+
+  if (showFocusMode && mappedPixelData && gridDimensions) {
+    return (
+      <FocusMode
+        mappedPixelData={mappedPixelData}
+        gridDimensions={gridDimensions}
+        colorSystem={colorSystem}
+        onExit={() => setShowFocusMode(false)}
+      />
+    );
+  }
 
   return (
-    <div className="min-h-screen bg-stone-100 p-6">
-      <header className="mb-6 text-center">
-        <h1 className="text-3xl font-bold text-stone-800">拼豆图纸生成器</h1>
-        <p className="mt-1 text-stone-600">上传图片，自动生成拼豆色格图与珠子用量清单</p>
-      </header>
-
-      <div className="mx-auto flex max-w-7xl flex-col gap-6 lg:flex-row">
-        {/* 左侧：上传区域 */}
-        <section className="w-full shrink-0 space-y-4 lg:w-64">
-          <div className="rounded-xl bg-white p-6 shadow-md">
-            <h2 className="mb-4 text-lg font-semibold text-stone-700">上传图片</h2>
-            <label className="flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-stone-300 bg-stone-50 px-6 py-10 transition hover:border-amber-500 hover:bg-amber-50">
-              <input
-                type="file"
-                accept="image/*"
-                onChange={handleFileUpload}
-                className="hidden"
-              />
-              <span className="mb-2 text-4xl">📷</span>
-              <span className="text-center text-sm text-stone-600">
-                点击或拖拽上传
-              </span>
-              <span className="mt-1 text-xs text-stone-500">JPG / PNG / GIF</span>
-            </label>
-
-            <div className="mt-4">
-              <label className="mb-2 block text-sm font-medium text-stone-700">
-                网格尺寸（珠子数量）
-              </label>
-              <input
-                type="range"
-                min="8"
-                max="256"
-                step="1"
-                value={gridSize}
-                onChange={(e) => setGridSize(Number(e.target.value))}
-                className="w-full accent-amber-500"
-              />
-              <div className="mt-1 flex justify-between text-sm text-stone-500">
-                <span>8</span>
-                <span className="font-semibold text-amber-600">{gridSize} × {gridSize}</span>
-                <span>256</span>
-              </div>
-            </div>
+    <div className="min-h-screen bg-stone-100">
+      <header className="border-b border-stone-200 bg-white px-4 py-3">
+        <div className="mx-auto flex max-w-7xl items-center justify-between">
+          <div>
+            <h1 className="text-lg font-bold text-stone-800">拼豆图纸生成器</h1>
+            <p className="text-xs text-stone-400">上传图片 → 智能像素化 → 导出拼豆图纸</p>
           </div>
-        </section>
-
-        {/* 中间：像素格预览 */}
-        <section className="flex-1">
-          <div className="rounded-xl bg-white p-6 shadow-md">
-            <h2 className="mb-4 text-lg font-semibold text-stone-700">拼豆图纸预览</h2>
-            {error && (
-              <div className="mb-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">
-                {error}
-              </div>
-            )}
-            {loading && (
-              <div className="flex min-h-[320px] items-center justify-center text-stone-500">
-                正在生成图纸…
-              </div>
-            )}
-            {!loading && beadData && (
+          <div className="flex flex-wrap items-center gap-2">
+            {mappedPixelData && (
               <>
-                <div className="mb-3 flex items-center gap-4">
-                  <label className="flex items-center gap-2 text-sm text-stone-600">
-                    <span>预览缩放：</span>
-                    <select
-                      value={previewZoom}
-                      onChange={(e) => setPreviewZoom(Number(e.target.value))}
-                      className="rounded border border-stone-300 bg-white px-2 py-1 text-stone-700"
-                    >
-                      <option value={0.5}>0.5×</option>
-                      <option value={1}>1×</option>
-                      <option value={2}>2×</option>
-                      <option value={4}>4×</option>
-                    </select>
-                  </label>
-                  <span className="text-xs text-stone-500">大网格时可放大查看色号</span>
-                </div>
-                <BeadGridPreview grid={beadData.grid} zoom={previewZoom} />
+                <label className="flex items-center gap-1 text-xs text-stone-500">
+                  <input type="checkbox" checked={showGridLines} onChange={(e) => setShowGridLines(e.target.checked)} />
+                  网格线
+                </label>
+                <label className="flex items-center gap-1 text-xs text-stone-500">
+                  <input type="checkbox" checked={showColorKeys} onChange={(e) => setShowColorKeys(e.target.checked)} />
+                  色号
+                </label>
+                <label className="flex items-center gap-1 text-xs text-stone-500">
+                  <input type="checkbox" checked={showMagnifier} onChange={(e) => setShowMagnifier(e.target.checked)} />
+                  放大镜
+                </label>
+                <button onClick={() => setShowDownloadModal(true)} className="rounded-lg bg-amber-500 px-3 py-1 text-xs font-semibold text-white hover:bg-amber-600">
+                  下载图纸
+                </button>
+                <button onClick={() => setShowFocusMode(true)} className="rounded-lg border border-green-400 bg-green-50 px-3 py-1 text-xs font-semibold text-green-700 hover:bg-green-100">
+                  专心拼豆
+                </button>
+                <button onClick={() => setShowCustomPalette(true)} className="rounded-lg border border-stone-300 px-3 py-1 text-xs text-stone-600 hover:bg-stone-50">
+                  自定义色板
+                </button>
               </>
             )}
-            {!imageUrl && !loading && (
-              <div className="flex min-h-[320px] items-center justify-center rounded-lg border-2 border-dashed border-stone-200 text-stone-400">
-                请先上传一张图片
-              </div>
-            )}
           </div>
-        </section>
-      </div>
+        </div>
+      </header>
 
-      {/* 下方：珠子用量清单 */}
-      <section className="mt-6 rounded-xl bg-white p-6 shadow-md">
-        <h2 className="mb-4 text-lg font-semibold text-stone-700">珠子用量清单</h2>
-        {colorList.length > 0 ? (
-          <>
-            <p className="mb-4 text-sm text-stone-600">
-              共需 <strong className="text-amber-600">{totalBeads}</strong> 颗珠子
-            </p>
-            <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6">
-              {colorList
-                .sort((a, b) => b.count - a.count)
-                .map((item) => (
-                  <div
-                    key={item.code}
-                    className="flex items-center gap-3 rounded-lg border border-stone-200 bg-stone-50 px-4 py-3"
-                  >
-                    <div
-                      className="h-8 w-8 shrink-0 rounded-md border border-stone-300"
-                      style={{ backgroundColor: item.hex }}
-                    />
-                    <div>
-                      <div className="font-medium text-stone-800">
-                        {item.code} {item.name}
-                      </div>
-                      <div className="text-sm text-stone-500">{item.count} 颗</div>
-                    </div>
-                  </div>
-                ))}
+      <main className="mx-auto flex max-w-7xl gap-4 p-4">
+        <aside className="w-64 flex-shrink-0">
+          <SettingsPanel
+            hasImage={!!originalImageUrl}
+            originalImageUrl={originalImageUrl}
+            onFileUpload={handleFileUpload}
+            granularity={granularity}
+            onGranularityChange={setGranularity}
+            pixelationMode={pixelationMode}
+            onPixelationModeChange={setPixelationMode}
+            paletteId={paletteId}
+            onPaletteChange={setPaletteId}
+            colorSystem={colorSystem}
+            onColorSystemChange={setColorSystem}
+            similarityThreshold={similarityThreshold}
+            onSimilarityThresholdChange={setSimilarityThreshold}
+            onAutoRemoveBg={handleAutoRemoveBg}
+            onProcessImage={() => processImage()}
+            processing={processing}
+            onAiOptimize={() => setShowAiModal(true)}
+            onCropImage={() => setShowCropModal(true)}
+          />
+        </aside>
+
+        <section className="flex-1">
+          {!mappedPixelData && !processing && (
+            <div className="flex min-h-[400px] items-center justify-center rounded-xl bg-white shadow-sm">
+              <p className="text-sm text-stone-400">
+                {originalImageUrl ? '调整参数后点击「生成拼豆图纸」' : '请先上传一张图片（支持 JPG/PNG/CSV）'}
+              </p>
             </div>
-          </>
-        ) : (
-          <p className="text-stone-500">上传图片并生成图纸后，将在此显示每种颜色的珠子用量</p>
-        )}
-      </section>
+          )}
+          {processing && (
+            <div className="flex min-h-[400px] items-center justify-center rounded-xl bg-white shadow-sm">
+              <div className="text-center">
+                <div className="mb-2 text-2xl animate-pulse">⏳</div>
+                <p className="text-sm text-stone-500">正在处理图像…</p>
+              </div>
+            </div>
+          )}
+          {mappedPixelData && !processing && (
+            <div className="overflow-auto rounded-xl bg-white p-4 shadow-sm">
+              <PixelatedPreviewCanvas
+                mappedPixelData={mappedPixelData}
+                gridDimensions={gridDimensions}
+                showGridLines={showGridLines}
+                showColorKeys={showColorKeys}
+                onCellHover={setTooltipData}
+                onCellClick={handleCellClick}
+                colorSystem={colorSystem}
+              />
+            </div>
+          )}
+        </section>
 
-      <footer className="mt-8 text-center text-sm text-stone-500">
+        <aside className="w-64 flex-shrink-0">
+          <ColorPanel
+            colorCounts={colorCounts}
+            totalCount={totalCount}
+            excludedKeys={excludedKeys}
+            onToggleExclude={handleToggleExclude}
+            colorSystem={colorSystem}
+          />
+        </aside>
+      </main>
+
+      <GridTooltip data={tooltipData} />
+
+      {showMagnifier && (
+        <MagnifierTool
+          mappedPixelData={mappedPixelData}
+          gridDimensions={gridDimensions}
+          visible={showMagnifier && !!tooltipData}
+          position={tooltipData}
+          colorSystem={colorSystem}
+        />
+      )}
+
+      {mappedPixelData && (
+        <FloatingToolbar
+          isEditMode={isEditMode}
+          onToggleEditMode={() => { setIsEditMode((v) => !v); setIsEraseMode(false); }}
+          isEraseMode={isEraseMode}
+          onToggleEraseMode={() => setIsEraseMode((v) => !v)}
+          onColorReplace={handleColorReplace}
+          onUndo={handleUndo}
+          canUndo={undoStack.length > 0}
+        />
+      )}
+
+      {isEditMode && (
+        <FloatingColorPalette
+          palette={activePalette}
+          selectedColor={selectedEditColor}
+          onSelectColor={setSelectedEditColor}
+          colorSystem={colorSystem}
+        />
+      )}
+
+      {showAiModal && originalImageUrl && (
+        <AIOptimizeModal imageSrc={originalImageUrl} onApply={handleAiApply} onClose={() => setShowAiModal(false)} />
+      )}
+      {showCropModal && originalImageUrl && (
+        <ImageCropperModal imageSrc={originalImageUrl} onCrop={handleCropApply} onClose={() => setShowCropModal(false)} />
+      )}
+      {showDownloadModal && mappedPixelData && (
+        <DownloadSettingsModal
+          mappedPixelData={mappedPixelData}
+          gridDimensions={gridDimensions}
+          colorSystem={colorSystem}
+          onClose={() => setShowDownloadModal(false)}
+        />
+      )}
+      {showCustomPalette && (
+        <CustomPaletteEditor
+          currentColorSystem={colorSystem}
+          onApply={handleCustomPaletteApply}
+          onClose={() => setShowCustomPalette(false)}
+        />
+      )}
+
+      <footer className="border-t border-stone-200 bg-white px-4 py-3 text-center text-xs text-stone-400">
         拼豆图纸生成器 BeanPix · React + Vite + Tailwind CSS
       </footer>
     </div>
